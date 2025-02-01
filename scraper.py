@@ -7,6 +7,7 @@ import undetected_chromedriver as uc
 from openai import OpenAI
 import os
 from dotenv import load_dotenv
+import json  # Add this import
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -43,6 +44,17 @@ def summarize_text(text):
     )
     return completion.choices[0].message.content
 
+def classify_text(text, filters):
+    client = OpenAI()
+    completion = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": f"Classify the following text into one of the categories: {', '.join(filters)}."},
+            {"role": "user", "content": text}
+        ]
+    )
+    return completion.choices[0].message.content.lower()
+
 class SearchResult:
     def __init__(self, title, link, summary):
         self.title = title
@@ -56,72 +68,102 @@ class SearchResult:
             "summary": self.summary
         }
 
-def get_search_results_selenium(query, start=0):
-    logger.info("Starting search for query: %s", query)
-    driver = uc.Chrome()
-    driver.get("https://www.google.com")
-
-    # Search for the query
-    search_box = driver.find_element(By.NAME, "q")
-    search_box.send_keys(query)
-    search_box.send_keys(Keys.RETURN)
-    
-    # Wait for results to load
+def parse_results(driver, filters):
     driver.implicitly_wait(2)
-    
-    results = []
+    new_results = []
     search_results = driver.find_elements(By.CSS_SELECTOR, "div.tF2Cxc")
     logger.info("Number of search results found: %d", len(search_results))
-    
-    for result in search_results[start:start+10]:  # Fetch 10 results at a time
+
+    for item in search_results:
         try:
-            title_element = result.find_element(By.TAG_NAME, "h3")
-            link_element = result.find_element(By.CSS_SELECTOR, "a")
-            
-            title = title_element.text
-            link = link_element.get_attribute("href")
-            logger.info("Found result: %s", title)
-            
-            # Summarize the webpage content
+            title_el = item.find_element(By.TAG_NAME, "h3")
+            link_el = item.find_element(By.CSS_SELECTOR, "a")
+            title = title_el.text
+            link = link_el.get_attribute("href")
             summary = summarize_text(link)
-            
-            results.append(SearchResult(title, link, summary))
-            logger.info("Added result: %s", title)
+            classification = classify_text(summary, filters)
+            if classification in filters:
+                new_results.append(SearchResult(title, link, summary))
         except Exception as e:
             logger.error("Error processing result: %s", e)
-        
-    driver.quit()
-    logger.info("Search completed for query: %s", query)
-    return results
+
+    return new_results
+
+def click_next_page(driver):
+    # Scroll to bottom before finding "Next" link
+    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+    driver.implicitly_wait(1)
+    try:
+        next_button = driver.find_element(By.ID, "pnnext")
+        next_button.click()
+        return True
+    except Exception as e:
+        logger.info("No more pages to load: %s", e)
+        return False
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     logger.info("Client connected")
     try:
-        query = None
-        start = 0
+        driver = None
+        results_queue = []
         while True:
-            if query is None:
-                query = await websocket.receive_text()
+            if not driver:
+                data = await websocket.receive_text()
+                data = json.loads(data)
+                query = data["query"]
+                filters = [key for key, value in data["filters"].items() if value]
                 logger.info("Received query from websocket: %s", query)
-            
-            results = get_search_results_selenium(query, start)
-            if not results:
-                break
-            
-            for i in range(0, len(results), 2):
-                batch = results[i:i+2]
-                await websocket.send_json([result.to_dict() for result in batch])
+                driver = uc.Chrome()
+                if "research" in filters:
+                    driver.get("https://scholar.google.com")
+                else:
+                    driver.get("https://www.google.com")
+                search_box = driver.find_element(By.NAME, "q")
+                search_box.send_keys(query)
+                search_box.send_keys(Keys.RETURN)
+                results_queue = parse_results(driver, filters)
+
+            # Send results three at a time
+            while len(results_queue) > 0:
+                chunk = results_queue[:3]
+                results_queue = results_queue[3:]
+                logger.info("Sending 3-result chunk to client.")
+                await websocket.send_json([r.to_dict() for r in chunk])
+
                 user_response = await websocket.receive_text()
                 if user_response.lower() == "yes":
-                    logger.info("User found what they need, stopping results.")
-                    return  # Stop sending more results if user found what they need
+                    logger.info("User found what they need, stopping.")
+                    driver.quit()
+                    return
                 elif user_response.lower() == "more":
-                    start += 10  # Move to the next set of results
-                    break  # Exit the inner loop to fetch more results
+                    logger.info("User wants more information.")
+                    continue
+                # If user says something else, continue sending the next chunk
+
+            # If queue is empty and user still wants more, try next page
+            logger.info("No more results on this page.")
+            await websocket.send_json([{"info": "No more results on this page."}])
+            user_response = await websocket.receive_text()
+            if user_response.lower() == "yes":
+                logger.info("User found what they need, stopping.")
+                driver.quit()
+                return
+            elif user_response.lower() == "more":
+                # Click next
+                if click_next_page(driver):
+                    logger.info("Loading next page")
+                    results_queue = parse_results(driver, filters)
+                    continue
+                else:
+                    logger.info("No further pages available.")
+                    driver.quit()
+                    return
     except WebSocketDisconnect:
         logger.info("Client disconnected")
+        if driver:
+            driver.quit()
 
 if __name__ == "__main__":
     import uvicorn
