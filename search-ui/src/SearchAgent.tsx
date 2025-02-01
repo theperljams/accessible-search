@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from "react";
 import "./SearchAgent.css"; // Import the new stylesheet
-import { storeResult } from "./Api"; // Import the API utility
+import { storeQueryAndResults } from "./Api"; // Import the API utility
 
 type SearchResult = {
   id: string;
@@ -22,12 +22,15 @@ const SearchAgent: React.FC = () => {
 
     ws.onmessage = (event) => {
       const data = JSON.parse(event.data);
+      console.log("Received data from server:", data);
       if (data.suggestions) {
         setSuggestions(data.suggestions);
       } else if (data.results) {
         const results: SearchResult[] = data.results;
         setResultQueue((prevQueue) => [...prevQueue, ...results]);
         setIsLoading(false); // Stop loading when results are received
+      } else if (data.info) {
+        console.log(data.info);
       }
     };
 
@@ -43,15 +46,14 @@ const SearchAgent: React.FC = () => {
       setResultQueue([]);
       setIsLoading(true); // Start loading when query is sent
       socket.send(JSON.stringify({ query }));
+      setSuggestions([]); // Clear suggestions after search
     }
   };
 
   const handleResponse = async (response: string) => {
     if (socket) {
       if (response.toLowerCase() === "yes") {
-        for (const result of currentResults) {
-          await storeResult(result);
-        }
+        await storeQueryAndResults(query, currentResults);
         socket.send(response);
         socket.close();
       } else {
@@ -71,12 +73,12 @@ const SearchAgent: React.FC = () => {
 
   // When new results arrive, stop loading and show them if none are displayed
   useEffect(() => {
-    if (resultQueue.length > 0 && currentResults.length === 0) {
+    if (resultQueue.length > 0) {
       setIsLoading(false);
       setCurrentResults(resultQueue.slice(0, 3));
       setResultQueue(resultQueue.slice(3));
     }
-  }, [resultQueue, currentResults]);
+  }, [resultQueue]);
 
   const handleKeyPress = (event: React.KeyboardEvent<HTMLInputElement>) => {
     if (event.key === "Enter") {
@@ -92,13 +94,8 @@ const SearchAgent: React.FC = () => {
     setQuery(event.target.value);
   };
 
-  const handleResultClick = async (result: SearchResult) => {
-    await storeResult(result);
-  };
-
   return (
     <div className="search-agent-container">
-      <h1 className="search-agent-title">Search Agent</h1>
       <input
         className="search-input"
         type="text"
@@ -115,9 +112,21 @@ const SearchAgent: React.FC = () => {
           </div>
         ))}
       </div>
+
+      {currentResults.length > 0 && (
+        <div className="control-buttons">
+          <button className="control-button" onClick={() => handleResponse("yes")}>
+            Yes, this is useful
+          </button>
+          <button className="control-button" onClick={() => handleResponse("more")}>
+            Next results
+          </button>
+        </div>
+      )}
+
       <div className="results-container">
         {currentResults.map((result, index) => (
-          <div className="result-item" key={index} onClick={() => handleResultClick(result)}>
+          <div className="result-item" key={index}>
             <h3>{result.title}</h3>
             <p>{result.summary}</p>
             <a href={result.link} target="_blank" rel="noopener noreferrer">
@@ -132,15 +141,6 @@ const SearchAgent: React.FC = () => {
           Loading next results...
         </div>
       )}
-
-      <div className="control-buttons">
-        <button className="control-button" onClick={() => handleResponse("yes")}>
-          Yes, this is useful
-        </button>
-        <button className="control-button" onClick={() => handleResponse("more")}>
-          Next results
-        </button>
-      </div>
     </div>
   );
 };

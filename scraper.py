@@ -10,6 +10,9 @@ from dotenv import load_dotenv
 import json
 import supabase
 import uuid
+import re
+from pydantic import BaseModel
+from typing import List, Dict
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -78,9 +81,24 @@ def match_search_results(query_embedding, similarity_threshold: float, match_cou
     logger.info("Matched search results: %s", result)
     return result
 
+def has_numerical_character(input_string: str) -> bool:
+    return bool(re.search(r'\d', input_string))
+
+def parse_numbered_list(input_string: str) -> list:
+    lines = input_string.strip().split('\n')
+    items = []
+
+    for line in lines:
+        parts = line.split('. ', 1)
+        if len(parts) == 2 and parts[0].isdigit():
+            item_content = parts[1].strip()
+            items.append(item_content)
+
+    return items
+
 def suggest_searches(query: str):
     client = OpenAI()
-    relevant_searches = match_search_results(embed_text(query), 0.6, 10)
+    relevant_searches = match_search_results(embed_text(query), 0.4, 10)
     logger.info("Relevant searches: %s", relevant_searches)
 
     prompt = f'''Below are some samples of the user's search history. Given the first word that the user types, I want you to suggest
@@ -92,7 +110,7 @@ def suggest_searches(query: str):
 
     And here is the current search: {query}
 
-    Come up with a list of 3 potential searches.
+    Give me a numbered list of 3 potential searches. No quotation marks.
     '''
 
     completion = client.chat.completions.create(
@@ -102,9 +120,10 @@ def suggest_searches(query: str):
             {"role": "user", "content": query}
         ]
     )
-    result = completion.choices[0].message.content.split('\n')
-    logger.info("Suggested searches: %s", result)
-    return result
+    result = completion.choices[0].message.content
+    search_queries = parse_numbered_list(result)
+    logger.info("Suggested searches: %s", search_queries)
+    return search_queries
 
 class SearchResult:
     def __init__(self, title, link, summary):
@@ -142,6 +161,7 @@ def parse_results(driver) -> list:
 
 def click_next_page(driver) -> bool:
     # Scroll to bottom before finding "Next" link
+    logger.info("Scrolling to bottom of page/clicking next")
     driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
     driver.implicitly_wait(1)
     try:
@@ -163,9 +183,17 @@ async def websocket_endpoint(websocket: WebSocket):
 
         while True:
             data = await websocket.receive_text()
-            data = json.loads(data)
+            if not data:
+                logger.error("Received empty data from websocket")
+                continue
+
+            try:
+                data = json.loads(data)
+            except json.JSONDecodeError as e:
+                logger.error("Error decoding JSON: %s", e)
+                continue
+
             if "suggest" in data:
-                # Removed 'await' because suggest_searches is synchronous
                 suggestions = suggest_searches(data["suggest"])
                 await websocket.send_json({"suggestions": suggestions})
                 continue
@@ -179,37 +207,58 @@ async def websocket_endpoint(websocket: WebSocket):
             search_box.send_keys(Keys.RETURN)
             results_queue = parse_results(driver)
 
+            end_response = ''
+
             # Send results three at a time
             while len(results_queue) > 0:
                 chunk = results_queue[:3]
+                logger.info("Chunk: %s", chunk)
                 results_queue = results_queue[3:]
+                logger.info("queue: %s", results_queue)
                 logger.info("Sending 3-result chunk to client.")
                 await websocket.send_json({"results": [r.to_dict() for r in chunk]})
 
                 user_response = await websocket.receive_text()
+                logger.info("User response: %s", user_response)
                 if user_response.lower() == "yes":
                     logger.info("User found what they need, stopping.")
                     driver.quit()
                     return
                 elif user_response.lower() == "more":
                     logger.info("User wants more information.")
+                    if len(results_queue) == 0:
+                        end_response = "more"
                     continue
+
+            logger.info("end_response: %s", end_response)
                 # If user says something else, continue sending the next chunk
 
             # If queue is empty and user still wants more, try next page
-            logger.info("No more results on this page.")
-            await websocket.send_json([{"info": "No more results on this page."}])
-            user_response = await websocket.receive_text()
-            if user_response.lower() == "yes":
+            if end_response.lower() == "yes":
                 logger.info("User found what they need, stopping.")
                 driver.quit()
                 return
-            elif user_response.lower() == "more":
+            elif end_response.lower() == "more":
                 # Click next
                 if click_next_page(driver):
                     logger.info("Loading next page")
                     results_queue = parse_results(driver)
-                    continue
+                    # Send results three at a time
+                    while len(results_queue) > 0:
+                        chunk = results_queue[:3]
+                        results_queue = results_queue[3:]
+                        logger.info("Sending 3-result chunk to client.")
+                        await websocket.send_json({"results": [r.to_dict() for r in chunk]})
+
+                        user_response = await websocket.receive_text()
+                        if user_response.lower() == "yes":
+                            logger.info("User found what they need, stopping.")
+                            driver.quit()
+                            return
+                        elif user_response.lower() == "more":
+                            logger.info("User wants more information.")
+                            continue
+                        # If user says something else, continue sending the next chunk
                 else:
                     logger.info("No further pages available.")
                     driver.quit()
@@ -219,14 +268,21 @@ async def websocket_endpoint(websocket: WebSocket):
         if driver:
             driver.quit()
 
-# You can choose to keep these routes async or make them sync.
-# Because they do blocking calls (OpenAI, supabase), it's okay to keep them sync.
-@app.post("/store_result")
-def store_result(result: dict):
-    result["embedding"] = embed_text(result["summary"])
-    supabase_client.table("search_results").insert(result).execute()
-    return {"status": "success"}
+class QueryResults(BaseModel):
+    query: str
+    results: List[Dict]
 
+@app.post("/store_query_and_results")
+def store_query_and_results(payload: QueryResults):
+    query = payload.query
+    results = payload.results
+
+    for result in results:
+        logger.info("Storing search result: %s", result)
+        result["embedding"] = embed_text(result["summary"])
+        result["query"] = query
+        supabase_client.table("search_results").insert(result).execute()
+    return {"status": "success"}
 
 if __name__ == "__main__":
     import uvicorn
