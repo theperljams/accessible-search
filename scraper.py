@@ -49,7 +49,7 @@ def classify_text(text, filters):
     completion = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
-            {"role": "system", "content": f"Classify the following text into one of the categories: {', '.join(filters)}."},
+            {"role": "system", "content": f"Classify the following text into one of the categories: {', '.join(filters)}. An opinion is any sort of online forum, reddit/social media platforms, or blog. A fact is something like wikipedia, or any sort of website that is made to provide trivia type facts or tutorials."},
             {"role": "user", "content": text}
         ]
     )
@@ -81,9 +81,10 @@ def parse_results(driver, filters):
             title = title_el.text
             link = link_el.get_attribute("href")
             summary = summarize_text(link)
-            classification = classify_text(summary, filters)
-            if classification in filters:
-                new_results.append(SearchResult(title, link, summary))
+            if "research" not in filters:
+                classification = classify_text(summary, filters)
+                if classification in filters:
+                    new_results.append(SearchResult(title, link, summary))
         except Exception as e:
             logger.error("Error processing result: %s", e)
 
