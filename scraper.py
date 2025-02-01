@@ -7,7 +7,9 @@ import undetected_chromedriver as uc
 from openai import OpenAI
 import os
 from dotenv import load_dotenv
-import json  # Add this import
+import json
+import supabase
+import uuid
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -31,9 +33,15 @@ logger.info("Starting FastAPI app")
 load_dotenv()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+supabase_client = supabase.create_client(SUPABASE_URL, SUPABASE_KEY)
+
 logger.info("Initializing OpenAI API")
 
-def summarize_text(text):
+# These are all synchronous because they call blocking code directly
+def summarize_text(text: str) -> str:
     client = OpenAI()
     completion = client.chat.completions.create(
         model="gpt-4o-mini",
@@ -44,31 +52,76 @@ def summarize_text(text):
     )
     return completion.choices[0].message.content
 
-def classify_text(text, filters):
+def embed_text(text: str):
     client = OpenAI()
+
+    response = client.embeddings.create(
+        input=text,
+        model="text-embedding-3-small"
+    )
+    return response.data[0].embedding
+
+def get_all_searches():
+    response = supabase_client.table('search_results').select('*').execute()
+    return response.data
+
+def match_search_results(query_embedding, similarity_threshold: float, match_count: int):
+    response = supabase_client.rpc(
+        "match_search_results",
+        {
+            "query_embedding": query_embedding,
+            "similarity_threshold": similarity_threshold,
+            "match_count": match_count
+        }
+    ).execute()
+    result = response.data
+    logger.info("Matched search results: %s", result)
+    return result
+
+def suggest_searches(query: str):
+    client = OpenAI()
+    relevant_searches = match_search_results(embed_text(query), 0.6, 10)
+    logger.info("Relevant searches: %s", relevant_searches)
+
+    prompt = f'''Below are some samples of the user's search history. Given the first word that the user types, I want you to suggest
+    what the user most likely wants to search for. For example, do the results contain a lot of reddit searches? Wikipedia? Factoids?
+    Does the user prefer tutorials? Suggest a google search that is the most likely to get the user what they want based on their search history.
+    Here are the user's last few searches and results:
+
+    {relevant_searches}
+
+    And here is the current search: {query}
+
+    Come up with a list of 3 potential searches.
+    '''
+
     completion = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
-            {"role": "system", "content": f"Classify the following text into one of the categories: {', '.join(filters)}."},
-            {"role": "user", "content": text}
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": query}
         ]
     )
-    return completion.choices[0].message.content.lower()
+    result = completion.choices[0].message.content.split('\n')
+    logger.info("Suggested searches: %s", result)
+    return result
 
 class SearchResult:
     def __init__(self, title, link, summary):
+        self.id = str(uuid.uuid4())
         self.title = title
         self.link = link
         self.summary = summary
 
     def to_dict(self):
         return {
+            "id": self.id,
             "title": self.title,
             "link": self.link,
             "summary": self.summary
         }
 
-def parse_results(driver, filters):
+def parse_results(driver) -> list:
     driver.implicitly_wait(2)
     new_results = []
     search_results = driver.find_elements(By.CSS_SELECTOR, "div.tF2Cxc")
@@ -81,15 +134,13 @@ def parse_results(driver, filters):
             title = title_el.text
             link = link_el.get_attribute("href")
             summary = summarize_text(link)
-            classification = classify_text(summary, filters)
-            if classification in filters:
-                new_results.append(SearchResult(title, link, summary))
+            new_results.append(SearchResult(title, link, summary))
         except Exception as e:
             logger.error("Error processing result: %s", e)
 
     return new_results
 
-def click_next_page(driver):
+def click_next_page(driver) -> bool:
     # Scroll to bottom before finding "Next" link
     driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
     driver.implicitly_wait(1)
@@ -101,6 +152,7 @@ def click_next_page(driver):
         logger.info("No more pages to load: %s", e)
         return False
 
+# This route must remain async because websockets in FastAPI are async
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -108,29 +160,31 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         driver = None
         results_queue = []
+
         while True:
-            if not driver:
-                data = await websocket.receive_text()
-                data = json.loads(data)
-                query = data["query"]
-                filters = [key for key, value in data["filters"].items() if value]
-                logger.info("Received query from websocket: %s", query)
-                driver = uc.Chrome()
-                if "research" in filters:
-                    driver.get("https://scholar.google.com")
-                else:
-                    driver.get("https://www.google.com")
-                search_box = driver.find_element(By.NAME, "q")
-                search_box.send_keys(query)
-                search_box.send_keys(Keys.RETURN)
-                results_queue = parse_results(driver, filters)
+            data = await websocket.receive_text()
+            data = json.loads(data)
+            if "suggest" in data:
+                # Removed 'await' because suggest_searches is synchronous
+                suggestions = suggest_searches(data["suggest"])
+                await websocket.send_json({"suggestions": suggestions})
+                continue
+
+            query = data["query"]
+            logger.info("Received query from websocket: %s", query)
+            driver = uc.Chrome()
+            driver.get("https://www.google.com")
+            search_box = driver.find_element(By.NAME, "q")
+            search_box.send_keys(query)
+            search_box.send_keys(Keys.RETURN)
+            results_queue = parse_results(driver)
 
             # Send results three at a time
             while len(results_queue) > 0:
                 chunk = results_queue[:3]
                 results_queue = results_queue[3:]
                 logger.info("Sending 3-result chunk to client.")
-                await websocket.send_json([r.to_dict() for r in chunk])
+                await websocket.send_json({"results": [r.to_dict() for r in chunk]})
 
                 user_response = await websocket.receive_text()
                 if user_response.lower() == "yes":
@@ -154,7 +208,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 # Click next
                 if click_next_page(driver):
                     logger.info("Loading next page")
-                    results_queue = parse_results(driver, filters)
+                    results_queue = parse_results(driver)
                     continue
                 else:
                     logger.info("No further pages available.")
@@ -164,6 +218,15 @@ async def websocket_endpoint(websocket: WebSocket):
         logger.info("Client disconnected")
         if driver:
             driver.quit()
+
+# You can choose to keep these routes async or make them sync.
+# Because they do blocking calls (OpenAI, supabase), it's okay to keep them sync.
+@app.post("/store_result")
+def store_result(result: dict):
+    result["embedding"] = embed_text(result["summary"])
+    supabase_client.table("search_results").insert(result).execute()
+    return {"status": "success"}
+
 
 if __name__ == "__main__":
     import uvicorn

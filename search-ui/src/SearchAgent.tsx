@@ -1,7 +1,9 @@
 import React, { useState, useEffect } from "react";
 import "./SearchAgent.css"; // Import the new stylesheet
+import { storeResult } from "./Api"; // Import the API utility
 
 type SearchResult = {
+  id: string;
   title: string;
   summary: string;
   link: string;
@@ -13,19 +15,20 @@ const SearchAgent: React.FC = () => {
   const [resultQueue, setResultQueue] = useState<SearchResult[]>([]);
   const [socket, setSocket] = useState<WebSocket | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(false);
-  const [filters, setFilters] = useState<{ opinions: boolean; research: boolean; facts: boolean }>({
-    opinions: false,
-    research: false,
-    facts: false,
-  });
+  const [suggestions, setSuggestions] = useState<string[]>([]);
 
   useEffect(() => {
     const ws = new WebSocket("ws://localhost:8000/ws");
 
     ws.onmessage = (event) => {
-      const results: SearchResult[] = JSON.parse(event.data);
-      setResultQueue((prevQueue) => [...prevQueue, ...results]);
-      setIsLoading(false); // Stop loading when results are received
+      const data = JSON.parse(event.data);
+      if (data.suggestions) {
+        setSuggestions(data.suggestions);
+      } else if (data.results) {
+        const results: SearchResult[] = data.results;
+        setResultQueue((prevQueue) => [...prevQueue, ...results]);
+        setIsLoading(false); // Stop loading when results are received
+      }
     };
 
     setSocket(ws);
@@ -39,13 +42,16 @@ const SearchAgent: React.FC = () => {
       setCurrentResults([]);
       setResultQueue([]);
       setIsLoading(true); // Start loading when query is sent
-      socket.send(JSON.stringify({ query, filters }));
+      socket.send(JSON.stringify({ query }));
     }
   };
 
-  const handleResponse = (response: string) => {
+  const handleResponse = async (response: string) => {
     if (socket) {
       if (response.toLowerCase() === "yes") {
+        for (const result of currentResults) {
+          await storeResult(result);
+        }
         socket.send(response);
         socket.close();
       } else {
@@ -74,15 +80,20 @@ const SearchAgent: React.FC = () => {
 
   const handleKeyPress = (event: React.KeyboardEvent<HTMLInputElement>) => {
     if (event.key === "Enter") {
-      sendQuery();
+      if (socket && query.trim()) {
+        // Request suggestions when user presses Enter
+        socket.send(JSON.stringify({ suggest: query.trim() }));
+      }
     }
   };
 
-  const handleFilterChange = (filter: string) => {
-    setFilters((prevFilters) => ({
-      ...prevFilters,
-      [filter]: !prevFilters[filter],
-    }));
+  const handleInputChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    // Only update local state here, no suggestions request
+    setQuery(event.target.value);
+  };
+
+  const handleResultClick = async (result: SearchResult) => {
+    await storeResult(result);
   };
 
   return (
@@ -92,40 +103,21 @@ const SearchAgent: React.FC = () => {
         className="search-input"
         type="text"
         value={query}
-        onChange={(e) => setQuery(e.target.value)}
+        onChange={handleInputChange}
         onKeyPress={handleKeyPress}
         placeholder="Enter your search query"
       />
       <button className="search-button" onClick={sendQuery}>Search</button>
-      <div className="filters-container">
-        <label>
-          <input
-            type="checkbox"
-            checked={filters.opinions}
-            onChange={() => handleFilterChange("opinions")}
-          />
-          Opinions
-        </label>
-        <label>
-          <input
-            type="checkbox"
-            checked={filters.research}
-            onChange={() => handleFilterChange("research")}
-          />
-          Research
-        </label>
-        <label>
-          <input
-            type="checkbox"
-            checked={filters.facts}
-            onChange={() => handleFilterChange("facts")}
-          />
-          Facts
-        </label>
+      <div className="suggestions-container">
+        {suggestions.map((suggestion, index) => (
+          <div key={index} className="suggestion-item" onClick={() => setQuery(suggestion)}>
+            {suggestion}
+          </div>
+        ))}
       </div>
       <div className="results-container">
         {currentResults.map((result, index) => (
-          <div className="result-item" key={index}>
+          <div className="result-item" key={index} onClick={() => handleResultClick(result)}>
             <h3>{result.title}</h3>
             <p>{result.summary}</p>
             <a href={result.link} target="_blank" rel="noopener noreferrer">
